@@ -15,7 +15,7 @@ type Options struct {
 	NumConnection int    `short:"p" long:"procs" default:"1"`
 	Output        string `short:"o" long:"output"`
 	Timeout       int    `short:"t" long:"timeout" default:"10"`
-	UserAgent     string `short:"u" long:"user-agent"`
+	UserAgent     string `short:"u" long:"user-agent" default:"curl/8.0.0"`
 	Referer       string `short:"r" long:"referer"`
 	Update        bool   `long:"check-update"`
 	Trace         bool   `long:"trace"`
@@ -44,7 +44,7 @@ func (opts Options) usage(version string) []byte {
   -p,  --procs <num>            the number of connections for a single URL (default 1)
   -o,  --output <filename>      output file to <filename>
   -t,  --timeout <seconds>      timeout of checking request in seconds (default 10s)
-  -u,  --user-agent <agent>     identify as <agent>
+  -u,  --user-agent <agent>     User-Agent for HTTP requests (default "curl/8.0.0")
   -r,  --referer <referer>      identify as <referer>
   --check-update                check if there is update available
   --trace                       display detail error messages
@@ -54,7 +54,7 @@ func (opts Options) usage(version string) []byte {
 
 func (opts Options) isupdate(version string) ([]byte, error) {
 	buf := bytes.Buffer{}
-	result, err := updater.CheckWithTag("Code-Hex", "pget", version)
+	result, err := updater.CheckWithTag("sixwaaaay", "pget", version)
 	if err != nil {
 		return nil, err
 	}

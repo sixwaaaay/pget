@@ -47,9 +47,10 @@ func (pget *Pget) Run(ctx context.Context, version string, args []string) error 
 	client := newDownloadClient(16)
 
 	target, err := Check(ctx, &CheckConfig{
-		URLs:    pget.URLs,
-		Timeout: time.Duration(pget.timeout) * time.Second,
-		Client:  client,
+		URLs:      pget.URLs,
+		Timeout:   time.Duration(pget.timeout) * time.Second,
+		Client:    client,
+		UserAgent: pget.useragent,
 	})
 	if err != nil {
 		return err

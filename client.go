@@ -8,6 +8,15 @@ import (
 	"time"
 )
 
+const defaultUserAgent = "curl/8.0.0"
+
+func resolveUserAgent(ua string) string {
+	if ua == "" {
+		return defaultUserAgent
+	}
+	return ua
+}
+
 func newDownloadClient(maxIdleConnsPerHost int) *http.Client {
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	dialer := newDialRateLimiter(&net.Dialer{

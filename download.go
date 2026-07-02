@@ -125,10 +125,7 @@ type DownloadOption func(c *DownloadConfig)
 
 func WithUserAgent(ua, version string) DownloadOption {
 	return func(c *DownloadConfig) {
-		if ua == "" {
-			ua = "Pget/" + version
-		}
-		c.makeRequestOption.useragent = ua
+		c.makeRequestOption.useragent = resolveUserAgent(ua)
 	}
 }
 
