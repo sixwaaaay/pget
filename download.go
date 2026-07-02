@@ -8,8 +8,9 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/cheggaaa/pb/v3"
 	"github.com/pkg/errors"
+	"github.com/vbauerster/mpb/v8"
+	"github.com/vbauerster/mpb/v8/decor"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -39,6 +40,13 @@ func (t *task) destPath() string {
 
 func (t *task) String() string {
 	return fmt.Sprintf("task[%d]: %q", t.ID, t.destPath())
+}
+
+func (t *task) remainingBytes() int64 {
+	if t.ID == t.Procs-1 {
+		return t.Range.high - t.Range.low
+	}
+	return t.Range.high - t.Range.low + 1
 }
 
 type makeRequestOption struct {
@@ -178,40 +186,83 @@ type parallelDownloadConfig struct {
 	*makeRequestOption
 }
 
+func newProgressContainer() *mpb.Progress {
+	return mpb.New(
+		mpb.WithOutput(stdout),
+		mpb.WithWidth(64),
+	)
+}
+
+func barDecorators(name string) []mpb.BarOption {
+	return []mpb.BarOption{
+		mpb.BarFillerOnComplete("="),
+		mpb.PrependDecorators(
+			decor.Name(name, decor.WC{C: decor.DSyncWidth | decor.DextraSpace}),
+		),
+		mpb.AppendDecorators(
+			decor.Counters(decor.SizeB1024(0), "%.1f / %.1f"),
+			decor.Percentage(decor.WC{W: 5}),
+			decor.AverageSpeed(decor.SizeB1024(0), "% .1f"),
+			decor.OnComplete(
+				decor.AverageETA(decor.ET_STYLE_GO, decor.WC{W: 8}),
+				"done",
+			),
+		),
+	}
+}
+
 func parallelDownload(ctx context.Context, c *parallelDownloadConfig) error {
 	eg, ctx := errgroup.WithContext(ctx)
 
-	bar := pb.Start64(c.ContentLength).SetWriter(stdout).Set(pb.Bytes, true)
-	defer bar.Finish()
+	p := newProgressContainer()
 
-	// check file size already downloaded for resume
-	size, err := checkProgress(c.PartialDir)
+	downloaded, err := checkProgress(c.PartialDir)
 	if err != nil {
 		return errors.Wrap(err, "failed to get directory size")
 	}
 
-	bar.SetCurrent(size)
+	totalBar := p.AddBar(c.ContentLength, barDecorators("Total")...)
+	totalBar.SetCurrent(downloaded)
+
+	taskBars := make(map[int]*mpb.Bar, len(c.Tasks))
+	for _, task := range c.Tasks {
+		taskBars[task.ID] = p.AddBar(task.remainingBytes(), barDecorators(fmt.Sprintf("#%d", task.ID))...)
+	}
 
 	for _, task := range c.Tasks {
 		task := task
+		bar := taskBars[task.ID]
 		eg.Go(func() error {
 			req, err := task.makeRequest(ctx, c.makeRequestOption)
 			if err != nil {
 				return err
 			}
-			return task.download(req, bar)
+			if err := task.download(req, bar, totalBar); err != nil {
+				return err
+			}
+			return nil
 		})
 	}
 
-	return eg.Wait()
+	if err := eg.Wait(); err != nil {
+		p.Shutdown()
+		return err
+	}
+
+	p.Wait()
+	return nil
 }
 
-func (t *task) download(req *http.Request, bar *pb.ProgressBar) error {
+func (t *task) download(req *http.Request, bar, totalBar *mpb.Bar) error {
 	resp, err := t.Client.Do(req)
 	if err != nil {
 		return errors.Wrapf(err, "failed to get response: %q", t.String())
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusPartialContent {
+		return errors.Errorf("unexpected status %d for range request %s (server may reject parallel downloads)", resp.StatusCode, t.Range.BytesRange())
+	}
 
 	output, err := os.OpenFile(t.destPath(), os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0666)
 	if err != nil {
@@ -219,13 +270,32 @@ func (t *task) download(req *http.Request, bar *pb.ProgressBar) error {
 	}
 	defer output.Close()
 
-	rd := bar.NewProxyReader(resp.Body)
+	rd := &barCountReader{
+		Reader:   resp.Body,
+		taskBar:  bar,
+		totalBar: totalBar,
+	}
 
 	if _, err := io.Copy(output, rd); err != nil {
 		return errors.Wrapf(err, "failed to write response body: %q", t.String())
 	}
 
 	return nil
+}
+
+type barCountReader struct {
+	io.Reader
+	taskBar  *mpb.Bar
+	totalBar *mpb.Bar
+}
+
+func (r *barCountReader) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	if n > 0 {
+		r.taskBar.IncrBy(n)
+		r.totalBar.IncrBy(n)
+	}
+	return n, err
 }
 
 func bindFiles(c *DownloadConfig, partialDir string) error {
@@ -238,7 +308,8 @@ func bindFiles(c *DownloadConfig, partialDir string) error {
 	}
 	defer f.Close()
 
-	bar := pb.Start64(c.ContentLength).SetWriter(stdout)
+	p := newProgressContainer()
+	bar := p.AddBar(c.ContentLength, barDecorators("Bind")...)
 
 	copyFn := func(name string) error {
 		subfp, err := os.Open(name)
@@ -248,27 +319,30 @@ func bindFiles(c *DownloadConfig, partialDir string) error {
 
 		defer subfp.Close()
 
-		proxy := bar.NewProxyReader(subfp)
+		proxy := bar.ProxyReader(subfp)
 		if _, err := io.Copy(f, proxy); err != nil {
+			proxy.Close()
 			return errors.Wrapf(err, "failed to copy %q", name)
 		}
 
-		return nil
+		return proxy.Close()
 	}
 
 	for i := 0; i < c.Procs; i++ {
 		partialFilename := getPartialFilePath(partialDir, c.Filename, c.Procs, i)
 		if err := copyFn(partialFilename); err != nil {
+			p.Shutdown()
 			return err
 		}
 
 		// remove a file in download location for join
 		if err := os.Remove(partialFilename); err != nil {
+			p.Shutdown()
 			return errors.Wrapf(err, "failed to remove %q in download location", partialFilename)
 		}
 	}
 
-	bar.Finish()
+	p.Wait()
 
 	// remove download location
 	// RemoveAll reason: will create .DS_Store in download location if execute on mac

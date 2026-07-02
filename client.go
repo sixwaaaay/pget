@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-const defaultUserAgent = "curl/8.0.0"
+const defaultUserAgent = "Wget/1.21.4"
 
 func resolveUserAgent(ua string) string {
 	if ua == "" {
