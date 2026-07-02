@@ -9,8 +9,6 @@ import (
 	"path/filepath"
 
 	"github.com/pkg/errors"
-	"github.com/vbauerster/mpb/v8"
-	"github.com/vbauerster/mpb/v8/decor"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -186,74 +184,35 @@ type parallelDownloadConfig struct {
 	*makeRequestOption
 }
 
-func newProgressContainer() *mpb.Progress {
-	return mpb.New(
-		mpb.WithOutput(stdout),
-		mpb.WithWidth(64),
-	)
-}
-
-func barDecorators(name string) []mpb.BarOption {
-	return []mpb.BarOption{
-		mpb.BarFillerOnComplete("="),
-		mpb.PrependDecorators(
-			decor.Name(name, decor.WC{C: decor.DSyncWidth | decor.DextraSpace}),
-		),
-		mpb.AppendDecorators(
-			decor.Counters(decor.SizeB1024(0), "%.1f / %.1f"),
-			decor.Percentage(decor.WC{W: 5}),
-			decor.AverageSpeed(decor.SizeB1024(0), "% .1f"),
-			decor.OnComplete(
-				decor.AverageETA(decor.ET_STYLE_GO, decor.WC{W: 8}),
-				"done",
-			),
-		),
-	}
-}
-
 func parallelDownload(ctx context.Context, c *parallelDownloadConfig) error {
 	eg, ctx := errgroup.WithContext(ctx)
 
-	p := newProgressContainer()
-
-	downloaded, err := checkProgress(c.PartialDir)
-	if err != nil {
-		return errors.Wrap(err, "failed to get directory size")
-	}
-
-	totalBar := p.AddBar(c.ContentLength, barDecorators("Total")...)
-	totalBar.SetCurrent(downloaded)
-
-	taskBars := make(map[int]*mpb.Bar, len(c.Tasks))
+	indicators := make(map[int]*ProgressIndicator, len(c.Tasks))
 	for _, task := range c.Tasks {
-		taskBars[task.ID] = p.AddBar(task.remainingBytes(), barDecorators(fmt.Sprintf("#%d", task.ID))...)
+		ind := &ProgressIndicator{
+			Title: fmt.Sprintf("part %d", task.ID),
+			Total: float64(task.remainingBytes()),
+		}
+		ind.Init()
+		indicators[task.ID] = ind
 	}
 
 	for _, task := range c.Tasks {
 		task := task
-		bar := taskBars[task.ID]
+		ind := indicators[task.ID]
 		eg.Go(func() error {
 			req, err := task.makeRequest(ctx, c.makeRequestOption)
 			if err != nil {
 				return err
 			}
-			if err := task.download(req, bar, totalBar); err != nil {
-				return err
-			}
-			return nil
+			return task.download(req, ind)
 		})
 	}
 
-	if err := eg.Wait(); err != nil {
-		p.Shutdown()
-		return err
-	}
-
-	p.Wait()
-	return nil
+	return eg.Wait()
 }
 
-func (t *task) download(req *http.Request, bar, totalBar *mpb.Bar) error {
+func (t *task) download(req *http.Request, ind *ProgressIndicator) error {
 	resp, err := t.Client.Do(req)
 	if err != nil {
 		return errors.Wrapf(err, "failed to get response: %q", t.String())
@@ -270,32 +229,13 @@ func (t *task) download(req *http.Request, bar, totalBar *mpb.Bar) error {
 	}
 	defer output.Close()
 
-	rd := &barCountReader{
-		Reader:   resp.Body,
-		taskBar:  bar,
-		totalBar: totalBar,
-	}
-
-	if _, err := io.Copy(output, rd); err != nil {
+	ind.Writer = output
+	if _, err := io.Copy(ind, resp.Body); err != nil {
 		return errors.Wrapf(err, "failed to write response body: %q", t.String())
 	}
+	ind.Close()
 
 	return nil
-}
-
-type barCountReader struct {
-	io.Reader
-	taskBar  *mpb.Bar
-	totalBar *mpb.Bar
-}
-
-func (r *barCountReader) Read(p []byte) (int, error) {
-	n, err := r.Reader.Read(p)
-	if n > 0 {
-		r.taskBar.IncrBy(n)
-		r.totalBar.IncrBy(n)
-	}
-	return n, err
 }
 
 func bindFiles(c *DownloadConfig, partialDir string) error {
@@ -308,41 +248,39 @@ func bindFiles(c *DownloadConfig, partialDir string) error {
 	}
 	defer f.Close()
 
-	p := newProgressContainer()
-	bar := p.AddBar(c.ContentLength, barDecorators("Bind")...)
+	ind := &ProgressIndicator{
+		Title: "binding",
+		Total: float64(c.ContentLength),
+	}
+	ind.Init()
+	defer ind.Close()
 
 	copyFn := func(name string) error {
 		subfp, err := os.Open(name)
 		if err != nil {
 			return errors.Wrapf(err, "failed to open %q in download location", name)
 		}
-
 		defer subfp.Close()
 
-		proxy := bar.ProxyReader(subfp)
-		if _, err := io.Copy(f, proxy); err != nil {
-			proxy.Close()
+		ind.Writer = f
+		if _, err := io.Copy(ind, subfp); err != nil {
 			return errors.Wrapf(err, "failed to copy %q", name)
 		}
 
-		return proxy.Close()
+		return nil
 	}
 
 	for i := 0; i < c.Procs; i++ {
 		partialFilename := getPartialFilePath(partialDir, c.Filename, c.Procs, i)
 		if err := copyFn(partialFilename); err != nil {
-			p.Shutdown()
 			return err
 		}
 
 		// remove a file in download location for join
 		if err := os.Remove(partialFilename); err != nil {
-			p.Shutdown()
 			return errors.Wrapf(err, "failed to remove %q in download location", partialFilename)
 		}
 	}
-
-	p.Wait()
 
 	// remove download location
 	// RemoveAll reason: will create .DS_Store in download location if execute on mac
